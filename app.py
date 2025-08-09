@@ -12,6 +12,8 @@ except Exception:
     ts = None
 
 st.set_page_config(page_title="A股一键分析 | 工作流", page_icon="📈", layout="wide")
+# === DEBUG 开关：排查 Token / 代码 / 网络 ===
+DEBUG = True
 
 # ----------------------- Helpers -----------------------
 def detect_market(code: str) -> str:
@@ -106,6 +108,9 @@ def mk_ts_pro():
     except Exception:
         pass
     pro = ts.pro_api(token) if ts else None
+    if DEBUG:
+    st.sidebar.write("DEBUG> secrets.TUSHARE_TOKEN 存在：", bool(token))
+
     return token, pro
 
 def fetch_daily(pro, ts_code, start_date):
@@ -145,7 +150,7 @@ def fetch_daily(pro, ts_code, start_date):
                 df = df.rename(columns={"vol":"volume"})
         return df[["date","open","high","low","close","volume"]].reset_index(drop=True)
     except Exception as e:
-        st.error(f"拉取日线失败：{e}")
+        st.exception(e)  # 打印完整堆栈，方便定位
         return pd.DataFrame()
 
 def fetch_basics(pro, ts_code):
@@ -219,6 +224,14 @@ tab1, tab2 = st.tabs(["🔍 分析", "⚙️ 说明与方法"])
 
 with tab1:
     st.write(f"**标的：** {ts_code}")
+if DEBUG:
+    st.info(f"DEBUG> ts_code={ts_code}")
+    try:
+        # 用最轻的接口验连通+权限
+        test = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,market', limit=1)
+        st.sidebar.write("DEBUG> stock_basic OK:", not test.empty)
+    except Exception as e:
+        st.sidebar.write("DEBUG> stock_basic ERROR:", e)
 
     if pro is None:
         st.stop()
