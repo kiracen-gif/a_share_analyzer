@@ -109,7 +109,7 @@ def mk_ts_pro():
         pass
     pro = ts.pro_api(token) if ts else None
     if DEBUG:
-    st.sidebar.write("DEBUG> secrets.TUSHARE_TOKEN 存在：", bool(token))
+        st.sidebar.write("DEBUG> secrets.TUSHARE_TOKEN 存在：", bool(token))
 
     return token, pro
 
