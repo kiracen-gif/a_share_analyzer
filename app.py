@@ -3,14 +3,12 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-# Optional plotting lib
 import matplotlib.pyplot as plt
 
-# Tushare
+# Tushare SDK
 try:
     import tushare as ts
-except Exception as e:
+except Exception:
     ts = None
 
 st.set_page_config(page_title="A股一键分析 | 工作流", page_icon="📈", layout="wide")
@@ -20,28 +18,24 @@ def detect_market(code: str) -> str:
     code = code.strip().upper()
     if code.endswith((".SH", ".SZ", ".BJ")):
         return code
-    # Simple market inference
     if code.startswith("6"):
         return f"{code}.SH"
     if code.startswith(("0","3")):
         return f"{code}.SZ"
     if code.startswith(("4","8")):
         return f"{code}.BJ"
-    return code  # leave as is
+    return code
 
 def atr(series_high, series_low, series_close, n=14):
     high = series_high.astype(float)
     low = series_low.astype(float)
     close = series_close.astype(float)
     prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
 def sma(series, n):
@@ -51,45 +45,36 @@ def roc(series, n=20):
     return series.pct_change(n)
 
 def score_technicals(df):
-    # expects columns: close, ma20, ma50, ma200, roc20, atr14, high_52w, low_52w
     s = 0
     reasons = []
-
     # Price vs MA200
     if df["close"].iloc[-1] > df["ma200"].iloc[-1]:
         s += 20; reasons.append("价>MA200 +20")
     else:
         s -= 20; reasons.append("价<MA200 -20")
-
     # MA50 vs MA200
     if df["ma50"].iloc[-1] > df["ma200"].iloc[-1]:
         s += 20; reasons.append("MA50>MA200 +20")
     else:
         s -= 10; reasons.append("MA50<MA200 -10")
-
     # MA20 vs MA50
     if df["ma20"].iloc[-1] > df["ma50"].iloc[-1]:
         s += 15; reasons.append("MA20>MA50 +15")
     else:
         s -= 10; reasons.append("MA20<MA50 -10")
-
-    # Momentum ROC20
+    # Momentum
     if df["roc20"].iloc[-1] > 0:
         s += 15; reasons.append("动量向上 +15")
     else:
         s -= 15; reasons.append("动量转弱 -15")
-
-    # Near 52w high
+    # 52w high/low proximity
     close = df["close"].iloc[-1]
     high52 = df["high_52w"].iloc[-1]
     low52 = df["low_52w"].iloc[-1]
     if pd.notna(high52) and (high52 - close) / close <= 0.05:
         s += 10; reasons.append("接近52周高 +10")
-
-    # Near 52w low
     if pd.notna(low52) and (close - low52) / close <= 0.05:
         s -= 10; reasons.append("接近52周低 -10")
-
     # Volatility
     atrp = df["atr14"].iloc[-1] / close
     if atrp <= 0.03:
@@ -98,7 +83,6 @@ def score_technicals(df):
         s -= 10; reasons.append("高波动 -10")
     else:
         reasons.append("中等波动 0")
-
     return int(s), reasons, float(atrp)
 
 def action_from_score(score, close, ma200):
@@ -113,19 +97,19 @@ def action_from_score(score, close, ma200):
     return "谨慎"
 
 def mk_ts_pro():
-    # First try st.secrets; then env; then user input
     token = st.secrets.get("TUSHARE_TOKEN", os.environ.get("TUSHARE_TOKEN", ""))
     if not token:
         st.warning("未检测到 Tushare Token。请在侧边栏输入，或在 Streamlit Secrets 中配置 TUSHARE_TOKEN。")
         return None, None
+    try:
+        ts.set_token(token)  # ensure pro_bar reads it
+    except Exception:
+        pass
     pro = ts.pro_api(token) if ts else None
     return token, pro
 
 def fetch_daily(pro, ts_code, start_date):
-    # Tushare pro_bar is convenient for adj
     try:
-        from tushare.util import dateu as du  # ensure installed
-        # Format dates
         if isinstance(start_date, dt.date):
             start = start_date.strftime("%Y%m%d")
         else:
@@ -133,13 +117,32 @@ def fetch_daily(pro, ts_code, start_date):
         end = dt.date.today().strftime("%Y%m%d")
 
         import tushare as ts2
+        # primary: qfq day bars
         df = ts2.pro_bar(ts_code=ts_code, adj='qfq', asset='E', freq='D', start_date=start, end_date=end)
+        # fallback: pro.daily
         if df is None or df.empty:
-            return pd.DataFrame()
-        # standardize columns
-        df = df.sort_values("trade_date")
-        df["date"] = pd.to_datetime(df["trade_date"])
-        df = df.rename(columns={"close":"close","open":"open","high":"high","low":"low","vol":"volume"})
+            df = pro.daily(ts_code=ts_code, start_date=start, end_date=end)
+            if df is None or df.empty:
+                return pd.DataFrame()
+            df = df.sort_values("trade_date")
+            df["date"] = pd.to_datetime(df["trade_date"])
+            # unify columns
+            rename_map = {"open":"open","high":"high","low":"low","close":"close","vol":"volume","volume":"volume"}
+            for k,v in list(rename_map.items()):
+                if k not in df.columns and k=="vol" and "vol" not in df.columns and "volume" in df.columns:
+                    # already has volume
+                    pass
+            if "volume" not in df.columns:
+                # some endpoints give 'vol'
+                if "vol" in df.columns:
+                    df["volume"] = df["vol"]
+                else:
+                    df["volume"] = np.nan
+        else:
+            df = df.sort_values("trade_date")
+            df["date"] = pd.to_datetime(df["trade_date"])
+            if "vol" in df.columns and "volume" not in df.columns:
+                df = df.rename(columns={"vol":"volume"})
         return df[["date","open","high","low","close","volume"]].reset_index(drop=True)
     except Exception as e:
         st.error(f"拉取日线失败：{e}")
@@ -147,16 +150,12 @@ def fetch_daily(pro, ts_code, start_date):
 
 def fetch_basics(pro, ts_code):
     try:
-        end = dt.date.today().strftime("%Y%m%d")
-        dfb = pro.daily_basic(ts_code=ts_code, trade_date=end, fields="ts_code,pe,pe_ttm,pb,ps_ttm,total_mv,circ_mv,turnover_rate,close")
-        if dfb is None or dfb.empty:
-            # Try last trade day backwards
-            for i in range(1,5):
-                day = (dt.date.today() - dt.timedelta(days=i)).strftime("%Y%m%d")
-                dfb = pro.daily_basic(ts_code=ts_code, trade_date=day, fields="ts_code,pe,pe_ttm,pb,ps_ttm,total_mv,circ_mv,turnover_rate,close")
-                if dfb is not None and not dfb.empty:
-                    break
-        return dfb
+        for i in range(0,5):
+            day = (dt.date.today() - dt.timedelta(days=i)).strftime("%Y%m%d")
+            dfb = pro.daily_basic(ts_code=ts_code, trade_date=day, fields="ts_code,pe,pe_ttm,pb,ps_ttm,total_mv,circ_mv,turnover_rate,close")
+            if dfb is not None and not dfb.empty:
+                return dfb
+        return pd.DataFrame()
     except Exception as e:
         st.info(f"估值数据暂不可用：{e}")
         return pd.DataFrame()
@@ -173,7 +172,6 @@ def compute_indicators(df):
     return out
 
 def score_fundamentals(pe_quantile):
-    # Map PE quantile to score
     if pd.isna(pe_quantile):
         return 0, "估值分位未知 0"
     if pe_quantile < 0.4:
@@ -183,8 +181,7 @@ def score_fundamentals(pe_quantile):
     return 0, "PE分位40%~70% 0"
 
 def combine_scores(tech_score, industry_score, company_score, val_score, policy_score, weight_tech=0.6):
-    other = industry_score + company_score + val_score + policy_score  # max 30+15+10+10=65
-    # Normalize others to 100 scale by /65*100 then weight 40%
+    other = industry_score + company_score + val_score + policy_score  # max 65
     other_norm = (other / 65.0) * 100.0
     final = int(round(tech_score * weight_tech + other_norm * (1 - weight_tech)))
     return final
@@ -209,7 +206,6 @@ with st.sidebar:
 
     token_manual = st.text_input("Tushare Token（留空则使用Secrets/环境变量）", value="")
 
-# Init Tushare
 if ts is None:
     st.error("未安装 tushare，请在 requirements.txt 中包含 tushare。")
 else:
@@ -217,7 +213,6 @@ else:
         ts.set_token(token_manual)
 
 token, pro = mk_ts_pro()
-
 ts_code = detect_market(code_input)
 
 tab1, tab2 = st.tabs(["🔍 分析", "⚙️ 说明与方法"])
@@ -239,11 +234,8 @@ with tab1:
     latest = di.iloc[-1]
 
     tech_score, tech_reasons, atrp = score_technicals(di)
-
-    # Fundamentals (optional) - map quantile to score
     val_score, val_reason = score_fundamentals(val_quantile)
 
-    # Combine to final score
     final = combine_scores(
         tech_score=tech_score,
         industry_score=industry_score,
@@ -254,7 +246,6 @@ with tab1:
     )
 
     col1, col2 = st.columns([2,1], gap="large")
-
     with col1:
         fig, ax = plt.subplots(figsize=(10,5))
         ax.plot(di["date"], di["close"], label="Close")
@@ -274,8 +265,7 @@ with tab1:
         st.write(f"行业：{industry_score}；公司相对：{company_score}；政策：{policy_score}")
 
         action = action_from_score(tech_score, latest['close'], latest['ma200'])
-        # Position sizing coefficient (per 10k capital)
-        atr_val = latest["atr14"]
+        atr_val = latest.get("atr14", np.nan)
         stop_loss = latest["close"] - 2 * atr_val if pd.notna(atr_val) else np.nan
         pos_coef = None
         if pd.notna(stop_loss) and stop_loss < latest["close"]:
@@ -300,7 +290,6 @@ with tab1:
     else:
         st.error("综合结论：回避/减仓")
 
-    # Basics snapshot
     basics = fetch_basics(pro, ts_code)
     if basics is not None and not basics.empty:
         st.markdown("#### 估值快照（最近交易日）")
