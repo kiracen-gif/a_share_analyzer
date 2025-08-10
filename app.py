@@ -124,7 +124,6 @@ def mk_ts_pro():
 def fetch_daily(pro, ts_code, start_date):
     # Tushare pro_bar is convenient for adj
     try:
-        from tushare.util import dateu as du  # ensure installed
         # Format dates
         if isinstance(start_date, dt.date):
             start = start_date.strftime("%Y%m%d")
