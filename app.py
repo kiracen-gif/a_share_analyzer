@@ -1,377 +1,323 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
-from pydantic import BaseModel
-from datetime import datetime, timedelta
+import os
+import datetime as dt
+import numpy as np
 import pandas as pd
-import json
-import akshare as ak
+import streamlit as st
 
-app = FastAPI()
+# Optional plotting lib
+import matplotlib.pyplot as plt
 
-# 参数配置
-params = {
-    'ma_periods': {'short': 5, 'medium': 20, 'long': 60},
-    'rsi_period': 14,
-    'bollinger_period': 20,
-    'bollinger_std': 2,
-    'volume_ma_period': 20,
-    'atr_period': 14
-}
+# Tushare
+try:
+    import tushare as ts
+except Exception as e:
+    ts = None
 
+st.set_page_config(page_title="A股一键分析 | 工作流", page_icon="📈", layout="wide")
 
-# 鉴权 Token 验证
-def verify_auth_token(authorization: str = Header(None)):
-    """
-    验证Authorization Header中的Bearer Token
-    """
-    print(authorization)
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization Header")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid Authorization scheme")
-    # 这里可以替换为实际的 Token 验证逻辑
-    valid_tokens = ["xue123", "xue1234"]  # 示例有效 Token 列表
-    if token not in valid_tokens:
-        raise HTTPException(status_code=403, detail="Invalid or Expired Token")
-    return token
+# ----------------------- Helpers -----------------------
+def detect_market(code: str) -> str:
+    code = code.strip().upper()
+    if code.endswith((".SH", ".SZ", ".BJ")):
+        return code
+    # Simple market inference
+    if code.startswith("6"):
+        return f"{code}.SH"
+    if code.startswith(("0","3")):
+        return f"{code}.SZ"
+    if code.startswith(("4","8")):
+        return f"{code}.BJ"
+    return code  # leave as is
 
+def atr(series_high, series_low, series_close, n=14):
+    high = series_high.astype(float)
+    low = series_low.astype(float)
+    close = series_close.astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(n).mean()
 
-class StockAnalysisRequest(BaseModel):
-    stock_code: str
-    market_type: str = 'A'
-    start_date: str = None
-    end_date: str = None
+def sma(series, n):
+    return series.rolling(n).mean()
 
+def roc(series, n=20):
+    return series.pct_change(n)
 
-def calculate_score(df):
-    """
-    计算评分
-    """
-    try:
-        score = 0
-        latest = df.iloc[-1]
+def score_technicals(df):
+    # expects columns: close, ma20, ma50, ma200, roc20, atr14, high_52w, low_52w
+    s = 0
+    reasons = []
 
-        # 趋势得分（30分）
-        if latest['MA5'] > latest['MA20']:
-            score += 15
-        if latest['MA20'] > latest['MA60']:
-            score += 15
-
-        # RSI得分（20分）
-        if 30 <= latest['RSI'] <= 70:
-            score += 20
-        elif latest['RSI'] < 30:  # 超卖
-            score += 15
-
-        # MACD得分（20分）
-        if latest['MACD'] > latest['Signal']:
-            score += 20
-
-        # 成交量得分（30分）
-        if latest['Volume_Ratio'] > 1.5:
-            score += 30
-        elif latest['Volume_Ratio'] > 1:
-            score += 15
-
-        return score
-
-    except Exception as e:
-        print(f"计算评分时出错: {str(e)}")
-        raise
-
-
-def calculate_indicators(df):
-    """
-    计算技术指标
-    """
-    try:
-        # 计算移动平均线
-        df['MA5'] = calculate_ema(df['close'], params['ma_periods']['short'])
-        df['MA20'] = calculate_ema(df['close'], params['ma_periods']['medium'])
-        df['MA60'] = calculate_ema(df['close'], params['ma_periods']['long'])
-
-        # 计算RSI
-        df['RSI'] = calculate_rsi(df['close'], params['rsi_period'])
-
-        # 计算MACD
-        df['MACD'], df['Signal'], df['MACD_hist'] = calculate_macd(df['close'])
-
-        # 计算布林带
-        df['BB_upper'], df['BB_middle'], df['BB_lower'] = calculate_bollinger_bands(
-            df['close'],
-            params['bollinger_period'],
-            params['bollinger_std']
-        )
-
-        # 成交量分析
-        df['Volume_MA'] = df['volume'].rolling(window=params['volume_ma_period']).mean()
-        df['Volume_Ratio'] = df['volume'] / df['Volume_MA']
-
-        # 计算ATR和波动率
-        df['ATR'] = calculate_atr(df, params['atr_period'])
-        df['Volatility'] = df['ATR'] / df['close'] * 100
-
-        # 动量指标
-        df['ROC'] = df['close'].pct_change(periods=10) * 100
-
-        return df
-
-    except Exception as e:
-        print(f"计算技术指标时出错: {str(e)}")
-        raise
-
-
-def _truncate_json_for_logging(json_obj, max_length=500):
-    """截断JSON对象用于日志记录，避免日志过大"""
-    json_str = json.dumps(json_obj, ensure_ascii=False)
-    if len(json_str) <= max_length:
-        return json_str
-    return json_str[:max_length] + f"... [截断，总长度: {len(json_str)}字符]"
-
-
-def get_stock_data(stock_code, market_type='A', start_date=None, end_date=None):
-    """获取股票或基金数据"""
-    if start_date is None:
-        start_date = (datetime.now() - timedelta(days=365)).strftime('%Y%m%d')
-    if end_date is None:
-        end_date = datetime.now().strftime('%Y%m%d')
-
-    try:
-        # 验证股票代码格式
-        if market_type == 'A':
-            valid_prefixes = ['0', '3', '6', '688', '8']
-            valid_format = False
-
-            for prefix in valid_prefixes:
-                if stock_code.startswith(prefix):
-                    valid_format = True
-                    break
-
-            if not valid_format:
-                error_msg = (
-                    f"无效的A股股票代码格式: {stock_code}。\n"
-                    "A股代码应以0、3、6、688或8开头"
-                )
-                raise ValueError(error_msg)
-
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"
-            )
-        elif market_type == 'HK':
-            df = ak.stock_hk_daily(
-                symbol=stock_code,
-                adjust="qfq"
-            )
-        elif market_type == 'US':
-            df = ak.stock_us_hist(
-                symbol=stock_code,
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"
-            )
-        elif market_type == 'ETF':
-            df = ak.fund_etf_hist_em(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"
-            )
-
-        elif market_type == 'LOF':
-            df = ak.fund_lof_hist_em(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"
-            )
-        else:
-            raise ValueError(f"不支持的市场类型:{market_type}")
-
-        # 重命名列名以匹配分析需求
-        df = df.rename(columns={
-            "日期": "date",
-            "开盘": "open",
-            "收盘": "close",
-            "最高": "high",
-            "最低": "low",
-            "成交量": "volume"
-        })
-
-        # 确保日期格式正确
-        df['date'] = pd.to_datetime(df['date'])
-
-        # 数据类型转换
-        numeric_columns = ['open', 'close', 'high', 'low', 'volume']
-        df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors='coerce')
-        # 删除空值
-        df = df.dropna()
-
-        return df.sort_values('date')
-
-    except Exception as e:
-        raise Exception(f"获取数据失败: {str(e)}")
-
-
-def calculate_ema(series, period):
-    """
-    计算指数移动平均线
-    """
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def calculate_rsi(series, period):
-    """
-    计算RSI指标
-    """
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_macd(series):
-    """
-    计算MACD指标
-    """
-    exp1 = series.ewm(span=12, adjust=False).mean()
-    exp2 = series.ewm(span=26, adjust=False).mean()
-    macd = exp1 - exp2
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist = macd - signal
-    return macd, signal, hist
-
-
-def calculate_bollinger_bands(series, period, std_dev):
-    """
-    计算布林带
-    """
-    middle = series.rolling(window=period).mean()
-    std = series.rolling(window=period).std()
-    upper = middle + (std * std_dev)
-    lower = middle - (std * std_dev)
-    return upper, middle, lower
-
-
-def calculate_atr(df, period):
-    """
-    计算ATR指标
-    """
-    high = df['high']
-    low = df['low']
-    close = df['close'].shift(1)
-
-    tr1 = high - low
-    tr2 = abs(high - close)
-    tr3 = abs(low - close)
-
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
-
-
-# def calculate_indicators(df):
-#     """
-#     计算技术指标
-#     """
-#     try:
-#         # 计算移动平均线
-#         df['MAS'] = calculate_ema(df['close'], params['ma_periods']['short'])
-#         df['MA20'] = calculate_ema(df['close'], params['ma_periods']['medium'])
-#         df['MA60'] = calculate_ema(df['close'], params['ma_periods']['long'])
-#
-#         # 计算RSI
-#         df['RSI'] = calculate_rsi(df['close'], params['rsi_period'])
-#
-#         # 计算MACD
-#         df['MACD'], df['Signal'], df['MACD_hist'] = calculate_macd(df['close'])
-#
-#         # 计算布林带
-#         df['BB_upper'], df['BB_middle'], df['BB_lower'] = calculate_bollinger_bands(
-#             df['close'],
-#             params['bollinger_period'],
-#             params['bollinger_std']
-#         )
-
-def get_recommendation(score):
-    """
-    根据得分给出建议
-    """
-    if score >= 80:
-        return '强烈推荐买入'
-    elif score >= 60:
-        return '建议买入'
-    elif score >= 40:
-        return '观望'
-    elif score >= 20:
-        return '建议卖出'
+    # Price vs MA200
+    if df["close"].iloc[-1] > df["ma200"].iloc[-1]:
+        s += 20; reasons.append("价>MA200 +20")
     else:
-        return '强烈建议卖出'
+        s -= 20; reasons.append("价<MA200 -20")
 
+    # MA50 vs MA200
+    if df["ma50"].iloc[-1] > df["ma200"].iloc[-1]:
+        s += 20; reasons.append("MA50>MA200 +20")
+    else:
+        s -= 10; reasons.append("MA50<MA200 -10")
 
-@app.post("/analyze-stock/")
-async def analyze_stock(request: StockAnalysisRequest, auth_token: str = Depends(verify_auth_token)):
+    # MA20 vs MA50
+    if df["ma20"].iloc[-1] > df["ma50"].iloc[-1]:
+        s += 15; reasons.append("MA20>MA50 +15")
+    else:
+        s -= 10; reasons.append("MA20<MA50 -10")
+
+    # Momentum ROC20
+    if df["roc20"].iloc[-1] > 0:
+        s += 15; reasons.append("动量向上 +15")
+    else:
+        s -= 15; reasons.append("动量转弱 -15")
+
+    # Near 52w high
+    close = df["close"].iloc[-1]
+    high52 = df["high_52w"].iloc[-1]
+    low52 = df["low_52w"].iloc[-1]
+    if pd.notna(high52) and (high52 - close) / close <= 0.05:
+        s += 10; reasons.append("接近52周高 +10")
+
+    # Near 52w low
+    if pd.notna(low52) and (close - low52) / close <= 0.05:
+        s -= 10; reasons.append("接近52周低 -10")
+
+    # Volatility
+    atrp = df["atr14"].iloc[-1] / close
+    if atrp <= 0.03:
+        s += 10; reasons.append("低波动 +10")
+    elif atrp >= 0.06:
+        s -= 10; reasons.append("高波动 -10")
+    else:
+        reasons.append("中等波动 0")
+
+    return int(s), reasons, float(atrp)
+
+def action_from_score(score, close, ma200):
+    if score >= 30 and close > ma200:
+        return "买入（趋势多头）"
+    if 10 <= score < 30:
+        return "分批/观察"
+    if -10 < score < 10:
+        return "观望"
+    if score <= -30 and close < ma200:
+        return "回避/减仓"
+    return "谨慎"
+
+def mk_ts_pro():
+    # First try st.secrets; then env; then user input
+    token = st.secrets.get("TUSHARE_TOKEN", os.environ.get("TUSHARE_TOKEN", ""))
+    if not token:
+        st.warning("未检测到 Tushare Token。请在侧边栏输入，或在 Streamlit Secrets 中配置 TUSHARE_TOKEN。")
+        return None, None
+    pro = ts.pro_api(token) if ts else None
+    return token, pro
+
+def fetch_daily(pro, ts_code, start_date):
+    # Tushare pro_bar is convenient for adj
     try:
-        # 获取股票数据
-        stock_data = get_stock_data(
-            request.stock_code,
-            request.market_type,
-            request.start_date,
-            request.end_date
-        )
+        from tushare.util import dateu as du  # ensure installed
+        # Format dates
+        if isinstance(start_date, dt.date):
+            start = start_date.strftime("%Y%m%d")
+        else:
+            start = str(start_date).replace("-", "")
+        end = dt.date.today().strftime("%Y%m%d")
 
-        print(stock_data)
-        # 计算技术指标
-        stock_data = calculate_indicators(stock_data)
-
-        # 计算评分
-        score = calculate_score(stock_data)
-
-        # 获取最新数据
-        latest = stock_data.iloc[-1]
-        prev = stock_data.iloc[-2]
-
-        # 生成技术指标概要
-        technical_summary = {
-            'trend': 'upward' if latest['MA5'] > latest['MA20'] else 'downward',
-            'volatility': f"{latest['Volatility']:.2f}%",
-            'volume_trend': 'increasing' if latest['Volume_Ratio'] > 1 else 'decreasing',
-            'rsi_level': latest['RSI']
-        }
-
-        # 获取近14日交易数据
-        recent_data = stock_data.tail(14).to_dict('records')
-
-        # 生成报告
-        report = {
-            'stock_code': request.stock_code,
-            'market_type': request.market_type,
-            'analysis_date': datetime.now().strftime('%Y-%m-%d'),
-            'score': score,
-            'price': latest['close'],
-            'price_change': (latest['close'] - prev['close']) / prev['close'] * 100,
-            'ma_trend': 'UP' if latest['MA5'] > latest['MA20'] else 'DOWN',
-            'rsi': latest['RSI'] if not pd.isna(latest['RSI']) else None,
-            'macd_signal': 'BUY' if latest['MACD'] > latest['Signal'] else 'SELL',
-            'volume_status': 'HIGH' if latest['Volume_Ratio'] > 1.5 else 'NORMAL',
-            'recommendation': get_recommendation(score)
-        }
-
-        # 返回结果
-        return {
-            "technical_summary": technical_summary,
-            "recent_data": recent_data,
-            "report": report
-        }
-
+        import tushare as ts2
+        df = ts2.pro_bar(ts_code=ts_code, adj='qfq', asset='E', freq='D', start_date=start, end_date=end)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        # standardize columns
+        df = df.sort_values("trade_date")
+        df["date"] = pd.to_datetime(df["trade_date"])
+        df = df.rename(columns={"close":"close","open":"open","high":"high","low":"low","vol":"volume"})
+        return df[["date","open","high","low","close","volume"]].reset_index(drop=True)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        st.error(f"拉取日线失败：{e}")
+        return pd.DataFrame()
 
-if __name__ == '__main__':
-    import uvicorn
+def fetch_basics(pro, ts_code):
+    try:
+        end = dt.date.today().strftime("%Y%m%d")
+        dfb = pro.daily_basic(ts_code=ts_code, trade_date=end, fields="ts_code,pe,pe_ttm,pb,ps_ttm,total_mv,circ_mv,turnover_rate,close")
+        if dfb is None or dfb.empty:
+            # Try last trade day backwards
+            for i in range(1,5):
+                day = (dt.date.today() - dt.timedelta(days=i)).strftime("%Y%m%d")
+                dfb = pro.daily_basic(ts_code=ts_code, trade_date=day, fields="ts_code,pe,pe_ttm,pb,ps_ttm,total_mv,circ_mv,turnover_rate,close")
+                if dfb is not None and not dfb.empty:
+                    break
+        return dfb
+    except Exception as e:
+        st.info(f"估值数据暂不可用：{e}")
+        return pd.DataFrame()
 
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+def compute_indicators(df):
+    out = df.copy()
+    out["ma20"] = sma(out["close"], 20)
+    out["ma50"] = sma(out["close"], 50)
+    out["ma200"] = sma(out["close"], 200)
+    out["roc20"] = roc(out["close"], 20)
+    out["atr14"] = atr(out["high"], out["low"], out["close"], 14)
+    out["high_52w"] = out["close"].rolling(252).max()
+    out["low_52w"] = out["close"].rolling(252).min()
+    return out
+
+def score_fundamentals(pe_quantile):
+    # Map PE quantile to score
+    if pd.isna(pe_quantile):
+        return 0, "估值分位未知 0"
+    if pe_quantile < 0.4:
+        return 10, "PE分位<40% +10"
+    if pe_quantile > 0.7:
+        return -10, "PE分位>70% -10"
+    return 0, "PE分位40%~70% 0"
+
+def combine_scores(tech_score, industry_score, company_score, val_score, policy_score, weight_tech=0.6):
+    other = industry_score + company_score + val_score + policy_score  # max 30+15+10+10=65
+    # Normalize others to 100 scale by /65*100 then weight 40%
+    other_norm = (other / 65.0) * 100.0
+    final = int(round(tech_score * weight_tech + other_norm * (1 - weight_tech)))
+    return final
+
+# ----------------------- UI -----------------------
+st.title("📈 A股一键分析 · 在线版（V1）")
+
+with st.sidebar:
+    st.header("参数")
+    code_input = st.text_input("股票代码", value="600519", help="可填 600519 或 600519.SH/000001.SZ 等格式")
+    start_date = st.date_input("起始日期", value=dt.date.today()-dt.timedelta(days=700))
+    risk_pct = st.number_input("单笔风险预算（占总资金）", min_value=0.002, max_value=0.05, value=0.01, step=0.002)
+    weight_tech = st.slider("技术面权重", 0.3, 0.8, 0.6, 0.05)
+
+    st.subheader("行业/政策（V1 手动评估，未来接入自动化）")
+    industry_score = st.slider("行业分（-30~+30）", -30, 30, 10)
+    company_score = st.slider("公司相对分（-15~+15）", -15, 15, 5)
+    policy_score = st.slider("政策分（-10~+10）", -10, 10, 4)
+    val_quantile = st.slider("估值PE分位（0~1，越低越便宜）", 0.0, 1.0, 0.45, 0.05)
+
+    st.caption("提示：行业/政策为参考打分，建议结合渠道与研报。")
+
+    token_manual = st.text_input("Tushare Token（留空则使用Secrets/环境变量）", value="")
+
+# Init Tushare
+if ts is None:
+    st.error("未安装 tushare，请在 requirements.txt 中包含 tushare。")
+else:
+    if token_manual:
+        ts.set_token(token_manual)
+
+token, pro = mk_ts_pro()
+
+ts_code = detect_market(code_input)
+
+tab1, tab2 = st.tabs(["🔍 分析", "⚙️ 说明与方法"])
+
+with tab1:
+    st.write(f"**标的：** {ts_code}")
+
+    if pro is None:
+        st.stop()
+
+    df = fetch_daily(pro, ts_code, start_date)
+    if df.empty:
+        st.warning("未获取到行情数据，请确认代码是否正确、Token是否有效。")
+        st.stop()
+
+    di = compute_indicators(df).dropna().reset_index(drop=True)
+    if di.empty or len(di) < 210:
+        st.warning("可用数据不足以计算长期指标（至少需要200+交易日）。")
+    latest = di.iloc[-1]
+
+    tech_score, tech_reasons, atrp = score_technicals(di)
+
+    # Fundamentals (optional) - map quantile to score
+    val_score, val_reason = score_fundamentals(val_quantile)
+
+    # Combine to final score
+    final = combine_scores(
+        tech_score=tech_score,
+        industry_score=industry_score,
+        company_score=company_score,
+        val_score=val_score,
+        policy_score=policy_score,
+        weight_tech=weight_tech
+    )
+
+    col1, col2 = st.columns([2,1], gap="large")
+
+    with col1:
+        fig, ax = plt.subplots(figsize=(10,5))
+        ax.plot(di["date"], di["close"], label="Close")
+        ax.plot(di["date"], di["ma20"], label="MA20")
+        ax.plot(di["date"], di["ma50"], label="MA50")
+        ax.plot(di["date"], di["ma200"], label="MA200")
+        ax.set_title(f"{ts_code} 价格与均线")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        st.pyplot(fig)
+
+    with col2:
+        st.subheader("指标打分")
+        st.metric("技术面总分", tech_score)
+        st.write("· " + "；".join(tech_reasons))
+        st.write(f"估值：{val_reason}")
+        st.write(f"行业：{industry_score}；公司相对：{company_score}；政策：{policy_score}")
+
+        action = action_from_score(tech_score, latest['close'], latest['ma200'])
+        # Position sizing coefficient (per 10k capital)
+        atr_val = latest["atr14"]
+        stop_loss = latest["close"] - 2 * atr_val if pd.notna(atr_val) else np.nan
+        pos_coef = None
+        if pd.notna(stop_loss) and stop_loss < latest["close"]:
+            pos_coef = (10000 * risk_pct) / (latest["close"] - stop_loss)
+
+        st.markdown("---")
+        st.subheader("操作建议（基于技术面）")
+        st.write(f"**建议**：{action}")
+        st.write(f"**止损价**：{stop_loss:.2f}" if pd.notna(stop_loss) else "止损价：N/A")
+        if pos_coef:
+            st.write(f"**建议仓位系数**：每 1 万资金买 **{pos_coef:.0f} 股**")
+        st.caption("仓位计算：单笔最大亏损≤资金×风险预算；止损=收盘-2×ATR14")
+
+    st.markdown("### 综合判断")
+    st.write(f"**综合评分（技术{int(weight_tech*100)}% + 基本面/行业/政策 {int((1-weight_tech)*100)}%）**：{final}")
+    if final >= 70:
+        st.success("综合结论：分批买入")
+    elif final >= 50:
+        st.info("综合结论：观察/轻仓")
+    elif final >= 30:
+        st.warning("综合结论：观望")
+    else:
+        st.error("综合结论：回避/减仓")
+
+    # Basics snapshot
+    basics = fetch_basics(pro, ts_code)
+    if basics is not None and not basics.empty:
+        st.markdown("#### 估值快照（最近交易日）")
+        st.dataframe(basics)
+
+with tab2:
+    st.markdown("""
+**方法概览**  
+- 行情：Tushare `pro_bar` 复权日线；指标：MA20/50/200、ROC20、ATR14、52周高低  
+- 技术打分：趋势>动量>波动权重；-100~+100  
+- 行业/政策：V1手动评分（未来接数据源自动化）  
+- 估值：以PE分位映射（<40% +10；>70% -10）  
+- 综合：`final = 技术×60% + 其它（行业+公司+估值+政策）标准化×40%`  
+- 风险控制：`止损 = 收盘 - 2×ATR14`；`仓位 = 资金×风险% / (入场-止损)`
+
+**使用提示**  
+- 代码可填 `600519` 或 `600519.SH`。  
+- 若首次使用，请在侧栏填入 Tushare Token，或在部署平台的 Secrets 中设置 `TUSHARE_TOKEN`。  
+- 本工具为研究参考，不构成投资建议。
+""")
